@@ -11,13 +11,22 @@
 - Если дат меньше, чем файлов — равномерно распределяет файлы по доступным датам (несколько коммитов на дату),
   проставляя GIT_AUTHOR_DATE и GIT_COMMITTER_DATE на выбранную дату (время фиксируем на 12:00:00).
 
+Использование:
+  python commit_by_date.py
+  python commit_by_date.py --repo sandbox_repo
+  python commit_by_date.py --repo /absolute/path/to/repo
+
+Параметры:
+  --repo PATH  Путь к репозиторию для работы (по умолчанию текущая директория).
+               Поддерживает относительные и абсолютные пути. Кроссплатформенно (Windows/Unix).
+
 Ограничения:
-- Если файлов больше, чем дат в диапазоне, скрипт завершится с сообщением об ошибке.
 - Скрипт не меняет содержимое файлов — только коммитит текущие незакоммиченные изменения.
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
@@ -29,29 +38,75 @@ def run_git(
     args: Sequence[str],
     check: bool = True,
     env: Optional[dict] = None,
+    cwd: Optional[str] = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Запускает git-команду и возвращает результат."""
+    """Запускает git-команду и возвращает результат (кроссплатформенно)."""
     return subprocess.run(
         ["git", *args],
         text=True,
         capture_output=True,
         check=check,
         env=env,
+        cwd=cwd,  # Работает на Windows и Unix
     )
 
 
-def ensure_repo_root() -> str:
+def resolve_repo_path(repo_arg: Optional[str]) -> Optional[str]:
+    """
+    Разрешает путь к репозиторию и проверяет его валидность (кроссплатформенно).
+    
+    Возвращает нормализованный абсолютный путь к корню git-репозитория.
+    Если repo_arg None, возвращает None (будет использована текущая директория).
+    """
+    if not repo_arg:
+        return None
+    
+    # Нормализуем путь (работает на Windows и Unix)
+    if os.path.isabs(repo_arg):
+        repo_path = os.path.normpath(repo_arg)  # Нормализует \ и /
+    else:
+        # Относительно текущей рабочей директории
+        repo_path = os.path.abspath(os.path.normpath(repo_arg))
+    
+    # Проверяем существование
+    if not os.path.isdir(repo_path):
+        sys.exit(f"Ошибка: директория не найдена: {repo_path}")
+    
+    # Проверяем, что это git-репозиторий
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=repo_path,  # cwd работает на всех платформах
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        actual_repo_root = result.stdout.strip()
+        # Нормализуем путь, возвращаемый Git (может содержать / на Windows)
+        return os.path.normpath(actual_repo_root)
+    except subprocess.CalledProcessError:
+        sys.exit(f"Ошибка: {repo_path} не является git-репозиторием")
+
+
+def ensure_repo_root(repo_path: Optional[str] = None) -> str:
     """Возвращает путь к корню репозитория и прекращает работу при ошибке."""
+    if repo_path:
+        # Если путь указан, используем его
+        return repo_path
+    
+    # Иначе определяем из текущей директории
     try:
         result = run_git(["rev-parse", "--show-toplevel"])
+        repo_root = result.stdout.strip()
+        # Нормализуем путь для кроссплатформенности
+        return os.path.normpath(repo_root)
     except subprocess.CalledProcessError as exc:
         sys.exit(f"Ошибка: не удалось определить корень репозитория ({exc.stderr.strip()})")
-    return result.stdout.strip()
 
 
-def ensure_clean_index() -> None:
+def ensure_clean_index(repo_path: Optional[str] = None) -> None:
     """Проверяет, что индекс пуст (нет подготовленных файлов)."""
-    result = run_git(["diff", "--cached", "--name-only"])
+    result = run_git(["diff", "--cached", "--name-only"], cwd=repo_path)
     staged = [line for line in result.stdout.splitlines() if line.strip()]
     if staged:
         sys.exit(
@@ -60,14 +115,14 @@ def ensure_clean_index() -> None:
         )
 
 
-def parse_uncommitted_files() -> List[str]:
+def parse_uncommitted_files(repo_path: Optional[str] = None) -> List[str]:
     """
     Возвращает список незакоммиченных файлов (отслеживаемые изменения и новые файлы).
 
     Используем `git status --porcelain -z`, чтобы корректно обрабатывать пробелы в путях
     и переименования (берем новую сторону для R/C).
     """
-    result = run_git(["status", "--porcelain=v1", "-z"])
+    result = run_git(["status", "--porcelain=v1", "-z"], cwd=repo_path)
     entries = result.stdout.split("\0")
 
     files: List[str] = []
@@ -159,7 +214,7 @@ def confirm_plan(pairs: Sequence[Tuple[str, date]]) -> None:
         sys.exit("Операция отменена пользователем.")
 
 
-def commit_file_on_date(file_path: str, commit_date: date) -> None:
+def commit_file_on_date(file_path: str, commit_date: date, repo_path: Optional[str] = None) -> None:
     """Делает коммит указанного файла с фиктивной датой."""
     commit_dt = datetime.combine(commit_date, time(hour=12, minute=0, second=0))
     date_str = commit_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -169,28 +224,41 @@ def commit_file_on_date(file_path: str, commit_date: date) -> None:
     env["GIT_COMMITTER_DATE"] = date_str
 
     # Добавляем только нужный файл
-    run_git(["add", "--", file_path])
+    run_git(["add", "--", file_path], cwd=repo_path)
 
     # Формируем простое сообщение
     message = f"Auto commit for {file_path}"
 
     try:
-        run_git(["commit", "-m", message], check=True, env=env).check_returncode()
+        run_git(["commit", "-m", message], check=True, env=env, cwd=repo_path).check_returncode()
         print(f"✓ {commit_date.isoformat()} — {file_path}")
     except subprocess.CalledProcessError as exc:
         sys.exit(f"Не удалось сделать коммит для {file_path}: {exc.stderr or exc.stdout}")
 
 
 def main() -> None:
-    repo_root = ensure_repo_root()
+    parser = argparse.ArgumentParser(
+        description="Коммит незакоммиченных файлов по датам в заданном диапазоне."
+    )
+    parser.add_argument(
+        "--repo",
+        type=str,
+        default=None,
+        help="Путь к репозиторию для работы (по умолчанию текущая директория)",
+    )
+    args = parser.parse_args()
+    
+    # Разрешаем путь к репозиторию
+    repo_path = resolve_repo_path(args.repo)
+    repo_root = ensure_repo_root(repo_path)
     print(f"Корень репозитория: {repo_root}")
-    ensure_clean_index()
+    ensure_clean_index(repo_path)
 
     start = read_date("Стартовая дата (YYYY-MM-DD): ")
     end = read_date("Конечная дата (YYYY-MM-DD): ")
     dates = build_dates(start, end)
 
-    files = parse_uncommitted_files()
+    files = parse_uncommitted_files(repo_path)
     if not files:
         sys.exit("Незакоммиченные файлы не найдены — делать нечего.")
 
@@ -198,7 +266,7 @@ def main() -> None:
     confirm_plan(plan)
 
     for file_path, commit_date in plan:
-        commit_file_on_date(file_path, commit_date)
+        commit_file_on_date(file_path, commit_date, repo_path)
 
     print("\nГотово! Все файлы закоммичены с разными датами.")
 
