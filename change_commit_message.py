@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -48,17 +47,15 @@ def rewrite(commit: str, new_message: str) -> None:
     env["TARGET_COMMIT"] = commit
     env["TARGET_MESSAGE"] = new_message
 
-    msg_filter = r"""python3 - <<'PY' "$GIT_COMMIT"
-import os, sys
-target = os.environ["TARGET_COMMIT"]
-new_msg = os.environ["TARGET_MESSAGE"]
-commit = sys.argv[1]
-old_msg = sys.stdin.read()
-if commit == target:
-    sys.stdout.write(new_msg)
-else:
-    sys.stdout.write(old_msg)
-PY"""
+    # Используем sh-скрипт: cat возвращает исходное сообщение, заменяем только целевой коммит.
+    msg_filter = r"""
+commit="$GIT_COMMIT"
+if [ "$commit" = "$TARGET_COMMIT" ]; then
+  printf '%s\n' "$TARGET_MESSAGE"
+else
+  cat
+fi
+"""
 
     cmd = [
         "git",
@@ -93,6 +90,18 @@ def main() -> None:
     ensure_clean_worktree()
     validate_commit_exists(commit)
     rewrite(commit, new_message)
+
+    # Опциональный push
+    answer = input("Сделать git push --force-with-lease? [y/N]: ").strip().lower()
+    if answer in {"y", "yes"}:
+        print("Выполняю push...")
+        try:
+            run_git(["push", "--force-with-lease"], check=True)
+            print("Push выполнен.")
+        except subprocess.CalledProcessError as exc:
+            sys.exit(f"Push не удался: {exc.stderr or exc.stdout}")
+    else:
+        print("Push пропущен. При необходимости выполните вручную: git push --force-with-lease")
 
 
 if __name__ == "__main__":
